@@ -1,0 +1,17 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.bak
+main_backup.py
+**/main_backup.py
+
+# Local MongoDB exports and database artifacts
+dump/
+**/dump/
+*.bson
+*.archive
+*.sqlite
+*.sqlite3
+*.db
