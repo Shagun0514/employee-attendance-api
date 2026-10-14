@@ -67,6 +67,8 @@ All errors use FastAPI's `{"detail": ...}` response shape. Request validation er
 | `GET /analytics/departments/{department}/trend` | Requires inclusive `from` and `to` dates, with a maximum range of 92 days. Returns one row per day, including weekends and days without records. Unknown department is 404. |
 | `GET /admin/explain/{endpoint}` | Returns raw MongoDB `executionStats` explain output for one of `attendance_list`, `employee_monthly`, `department_summary`, `late_leaderboard`, or `department_trend`. Pass the parameters required by the selected endpoint. |
 
+Punch-out and regularization use conditional MongoDB updates against the punch-field snapshot used for their calculations. If another operation changes that snapshot first, the stale request is rejected with the route's existing HTTP 409 conflict response. Retrying after re-reading the record avoids silently overwriting the newer state.
+
 ### Calculation conventions
 
 - Shift times and attendance-day assignment use IST (UTC+05:30); stored instants are UTC and truncated to whole seconds.
@@ -96,6 +98,8 @@ set RUN_MONGO_INTEGRATION=1
 The integration fixture does not use `MONGO_TEST_URI` as the application database name; it creates an isolated
 `employee_attendance_test_<uuid>` database and drops only the database whose ownership marker it verifies. If the URI is
 unset or the opt-in flag is absent, those tests skip. Use a MongoDB instance reserved for testing.
+
+The normal command above skips the opt-in MongoDB tests. The latest verified normal run reported 48 passed and 11 skipped; with `MONGO_TEST_URI` and `RUN_MONGO_INTEGRATION=1` enabled, the latest integration-enabled run reported 59 passed. Both runs reported two existing FastAPI startup-event deprecation warnings.
 
 ## Standalone 100,000-record benchmark
 
