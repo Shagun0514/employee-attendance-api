@@ -764,12 +764,18 @@ def regularize_attendance(
         "changes": changes,
     }
 
+    history_guard = (
+        {"history": current["history"]}
+        if "history" in current
+        else {"history": {"$exists": False}}
+    )
+
     # Conditional update prevents concurrent corrections from losing history.
     try:
         result = db.attendance_logs.update_one(
             {
                 "_id": current["_id"],
-                "history": current.get("history", []),
+                **history_guard,
                 "status": current["status"],
                 "punch_in": current.get("punch_in"),
                 "punch_out": current.get("punch_out"),

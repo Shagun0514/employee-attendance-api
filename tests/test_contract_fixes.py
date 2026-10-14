@@ -943,6 +943,129 @@ def test_regularization_history_persists_once_and_invalid_request_does_not_appen
     assert unchanged == persisted
 
 
+@pytest.mark.integration
+def test_regularization_creates_history_when_seeded_field_is_missing(isolated_mongodb):
+    isolated_mongodb.employees.insert_one(employee_document())
+    original_punch_in = datetime(2026, 10, 13, 4, 45, tzinfo=timezone.utc)
+    isolated_mongodb.attendance_logs.insert_one({
+        "emp_code": "EMP0001", "date": "2026-10-13", "status": "PRESENT",
+        "punch_in": original_punch_in, "punch_out": None, "work_hours": None,
+        "late_minutes": 45, "overtime_minutes": 0, "half_day": False,
+        # The candidate DATA_MODEL.md says a missing history field means [].
+    })
+    corrected_punch_in = int(
+        datetime(2026, 10, 13, 4, 28, tzinfo=timezone.utc).timestamp() * 1000
+    )
+
+    response = request("PATCH", "/attendance/EMP0001/2026-10-13", json={
+        "punch_in": corrected_punch_in,
+        "reason": "Corrected start time",
+        "regularized_by": "supervisor",
+    })
+
+    assert response.status_code == 200
+    assert response.json()["punch_in"] == corrected_punch_in
+    assert response.json()["late_minutes"] == 28
+    persisted = isolated_mongodb.attendance_logs.find_one(
+        {"emp_code": "EMP0001", "date": "2026-10-13"}
+    )
+    assert persisted["punch_in"] == datetime(2026, 10, 13, 4, 28, tzinfo=timezone.utc)
+    assert len(persisted["history"]) == 1
+    history = persisted["history"][0]
+    assert set(history) == {"at", "by", "reason", "changes"}
+    assert isinstance(history["at"], datetime)
+    assert history["by"] == "supervisor"
+    assert history["reason"] == "Corrected start time"
+    assert set(history["changes"]) == {"punch_in", "late_minutes"}
+    assert history["changes"]["punch_in"] == {
+        "from": int(original_punch_in.timestamp() * 1000),
+        "to": corrected_punch_in,
+    }
+    assert history["changes"]["late_minutes"] == {"from": 45, "to": 28}
+
+
+@pytest.mark.integration
+def test_competing_regularizations_from_missing_history_snapshot_conflict(
+    isolated_mongodb, monkeypatch,
+):
+    isolated_mongodb.employees.insert_one(employee_document())
+    original_punch_in = datetime(2026, 10, 13, 4, 45, tzinfo=timezone.utc)
+    isolated_mongodb.attendance_logs.insert_one({
+        "emp_code": "EMP0001", "date": "2026-10-13", "status": "PRESENT",
+        "punch_in": original_punch_in, "punch_out": None, "work_hours": None,
+        "late_minutes": 45, "overtime_minutes": 0, "half_day": False,
+    })
+
+    attendance = isolated_mongodb.attendance_logs
+    original_find_one = attendance.find_one
+    hook_fired = False
+    winning_result = None
+    winner_punch_in = datetime(2026, 10, 13, 4, 28, tzinfo=timezone.utc)
+    stale_punch_in = datetime(2026, 10, 13, 4, 15, tzinfo=timezone.utc)
+
+    class AttendanceReadHook:
+        def find_one(self, query, *args, **kwargs):
+            nonlocal hook_fired, winning_result
+            snapshot = original_find_one(query, *args, **kwargs)
+            targets_record = (
+                query.get("emp_code") == "EMP0001"
+                and query.get("date") == "2026-10-13"
+            )
+            if not hook_fired and targets_record:
+                hook_fired = True
+                winning_result = main.regularize_attendance(
+                    "EMP0001", "2026-10-13", main.RegularizeIn(
+                        punch_in=int(winner_punch_in.timestamp() * 1000),
+                        reason="First correction",
+                        regularized_by="manager-one",
+                    ),
+                )
+            return snapshot
+
+        def __getattr__(self, name):
+            return getattr(attendance, name)
+
+    class DatabaseReadHook:
+        def __getattr__(self, name):
+            if name == "attendance_logs":
+                return AttendanceReadHook()
+            return getattr(isolated_mongodb, name)
+
+    monkeypatch.setattr(main, "db", DatabaseReadHook())
+    response = request("PATCH", "/attendance/EMP0001/2026-10-13", json={
+        "punch_in": int(stale_punch_in.timestamp() * 1000),
+        "reason": "Second correction",
+        "regularized_by": "manager-two",
+    })
+
+    assert hook_fired
+    assert winning_result is not None
+    assert winning_result["punch_in"] == int(winner_punch_in.timestamp() * 1000)
+    assert len(winning_result["history"]) == 1
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Attendance record changed concurrently; retry the correction"
+    )
+    persisted = attendance.find_one({"emp_code": "EMP0001", "date": "2026-10-13"})
+    assert persisted["punch_in"] == winner_punch_in
+    assert persisted["late_minutes"] == 28
+    assert persisted["punch_out"] is None
+    assert persisted["work_hours"] is None
+    assert persisted["overtime_minutes"] == 0
+    assert persisted["half_day"] is False
+    assert len(persisted["history"]) == 1
+    history = persisted["history"][0]
+    assert set(history) == {"at", "by", "reason", "changes"}
+    assert isinstance(history["at"], datetime)
+    assert history["by"] == "manager-one"
+    assert history["reason"] == "First correction"
+    assert set(history["changes"]) == {"punch_in", "late_minutes"}
+    assert history["changes"]["punch_in"] == {
+        "from": int(original_punch_in.timestamp() * 1000),
+        "to": int(winner_punch_in.timestamp() * 1000),
+    }
+
+
 def test_punch_out_selects_latest_even_if_closed_and_does_not_fallback(monkeypatch):
     closed_latest = {
         "_id": "newest", "punch_in": datetime(2026, 10, 13, 10, tzinfo=timezone.utc),
