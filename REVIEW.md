@@ -38,11 +38,32 @@ exist in `app/main.py`.
 - The starter's defaults of page 1 and page size 20 are the contract defaults. The current implementation retains them and
   adds the required validation and maximum page size.
 
+## Cross-route concurrency review
+
+The punch-out and regularization handlers both calculate updates from an attendance document they read first. Before the
+hardening change, punch-out guarded only the record ID and open `punch_out`, while regularization guarded the record ID and
+history array. Since punch-out does not append history, a regularization based on an earlier open-record snapshot could
+overwrite derived fields after punch-out closed the record. In the reverse ordering, punch-out could commit values
+calculated from an old `punch_in` after regularization changed that punch time.
+
+The current punch-out compare-and-set filter checks `_id`, the snapshotted `punch_in`, and `punch_out: null`. The
+regularization filter retains the `_id` and exact history-array guard and also checks the snapshotted `status`, `punch_in`,
+and `punch_out`. A filter mismatch produces the existing HTTP 409 conflict response for that route; successful corrections
+continue to append one history entry atomically with their field updates.
+
+Two deterministic MongoDB integration cases in `tests/test_contract_fixes.py` force both orderings: regularization reads
+first and punch-out commits before its update, and punch-out reads first and regularization commits before its update. They
+verify the stale request's 409 response and persisted punch values, derived fields, and history. These controlled
+interleavings are regression tests, not load testing or a measure of contention under simultaneous production traffic.
+
 ## Tests and benchmark
 
 - The normal suite was run with `.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider`: **48 passed, 9 skipped,
-  0 failed**, with two warnings. The skipped cases are explicitly opt-in MongoDB integration tests; MongoDB integration
-  was not enabled for this run.
+  11 skipped, 0 failed**, with two warnings. The skipped cases are explicitly opt-in MongoDB integration tests; MongoDB
+  integration was not enabled for this run.
+- With `MONGO_TEST_URI=mongodb://localhost:27017/employee_attendance_test_runner` and
+  `RUN_MONGO_INTEGRATION=1`, the integration-enabled full suite reported **59 passed, 0 failed, 0 skipped**, with two
+  warnings. This includes both deterministic cross-route stale-write cases.
 - MongoDB integration tests use `MONGO_TEST_URI` and `RUN_MONGO_INTEGRATION=1`, with a unique temporary database and an
   ownership marker.
 - The standalone benchmark completed against **MongoDB 8.2.1**, using **1,000 synthetic employees** and **exactly 100,000
