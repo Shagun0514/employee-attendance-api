@@ -259,7 +259,11 @@ def test_punch_out_omitted_timestamp_still_updates_open_record(monkeypatch):
     response = request("POST", "/attendance/punch-out", json={"emp_code": "EMP0001"})
     assert response.status_code == 200
     assert response.json()["punch_out"] is not None
-    assert updates == [{"_id": "attendance-1", "punch_out": None}]
+    assert updates == [{
+        "_id": "attendance-1",
+        "punch_in": record["punch_in"],
+        "punch_out": None,
+    }]
 
 
 @pytest.mark.parametrize("bad_joined_on", [1791849600, 1791849600.0, "2026-10-13T00:00:00", "2026-02-30", "2026-1-3"])
@@ -978,4 +982,116 @@ def test_punch_out_conditional_update_guard_returns_conflict(monkeypatch):
     timestamp = int(datetime(2026, 10, 13, 18, tzinfo=timezone.utc).timestamp() * 1000)
     response = request("POST", "/attendance/punch-out", json={"emp_code": "EMP0001", "punched_at": timestamp})
     assert response.status_code == 409
-    assert seen == [{"_id": "open", "punch_out": None}]
+    assert seen == [{"_id": "open", "punch_in": punch_in, "punch_out": None}]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("stale_route", "winning_operation"),
+    [
+        ("regularization", "punch_out"),
+        ("punch_out", "regularization"),
+    ],
+)
+def test_cross_route_stale_write_returns_conflict_and_preserves_consistent_state(
+    isolated_mongodb, monkeypatch, stale_route, winning_operation,
+):
+    isolated_mongodb.employees.insert_one(employee_document())
+    original_punch_in = datetime(2026, 10, 13, 4, 30, tzinfo=timezone.utc)
+    corrected_punch_in = datetime(2026, 10, 13, 4, 0, tzinfo=timezone.utc)
+    punch_out = datetime(2026, 10, 13, 13, 0, tzinfo=timezone.utc)
+    isolated_mongodb.attendance_logs.insert_one({
+        "emp_code": "EMP0001", "date": "2026-10-13", "status": "PRESENT",
+        "punch_in": original_punch_in, "punch_out": None,
+        "work_hours": None, "late_minutes": 30, "overtime_minutes": 0,
+        "half_day": False, "history": [],
+    })
+
+    attendance = isolated_mongodb.attendance_logs
+    original_find_one = attendance.find_one
+    hook_fired = False
+    winner_status = None
+
+    class AttendanceRaceProxy:
+        def find_one(self, query, *args, **kwargs):
+            nonlocal hook_fired, winner_status
+            snapshot = original_find_one(query, *args, **kwargs)
+            targets_record = (
+                query.get("emp_code") == "EMP0001"
+                and ("date" in query or "punch_in" in query)
+            )
+            if not hook_fired and targets_record:
+                hook_fired = True
+                if winning_operation == "punch_out":
+                    updated = main.punch_out(main.PunchInIn(
+                        emp_code="EMP0001",
+                        punched_at=int(punch_out.timestamp() * 1000),
+                    ))
+                    winner_status = 200 if updated else None
+                else:
+                    updated = main.regularize_attendance(
+                        "EMP0001", "2026-10-13", main.RegularizeIn(
+                            punch_in=int(corrected_punch_in.timestamp() * 1000),
+                            reason="Corrected missed start time",
+                            regularized_by="supervisor",
+                        ),
+                    )
+                    winner_status = 200 if updated else None
+            return snapshot
+
+        def __getattr__(self, name):
+            return getattr(attendance, name)
+
+    class DatabaseRaceProxy:
+        def __getattr__(self, name):
+            if name == "attendance_logs":
+                return AttendanceRaceProxy()
+            return getattr(isolated_mongodb, name)
+
+    monkeypatch.setattr(main, "db", DatabaseRaceProxy())
+
+    if stale_route == "regularization":
+        response = request("PATCH", "/attendance/EMP0001/2026-10-13", json={
+            "punch_in": int(corrected_punch_in.timestamp() * 1000),
+            "reason": "Corrected missed start time",
+            "regularized_by": "supervisor",
+        })
+    else:
+        response = request("POST", "/attendance/punch-out", json={
+            "emp_code": "EMP0001",
+            "punched_at": int(punch_out.timestamp() * 1000),
+        })
+
+    assert hook_fired
+    assert winner_status == 200
+    assert response.status_code == 409
+    expected_conflict = (
+        "Attendance record was closed by another request"
+        if stale_route == "punch_out"
+        else "Attendance record changed concurrently; retry the correction"
+    )
+    assert response.json()["detail"] == expected_conflict
+    persisted = attendance.find_one({"emp_code": "EMP0001", "date": "2026-10-13"})
+    if winning_operation == "punch_out":
+        assert persisted["punch_in"] == original_punch_in
+        assert persisted["punch_out"] == punch_out
+        assert persisted["work_hours"] == 8.5
+        assert persisted["late_minutes"] == 30
+        assert persisted["overtime_minutes"] == 0
+        assert persisted["half_day"] is False
+        assert persisted["history"] == []
+    else:
+        assert persisted["punch_in"] == corrected_punch_in
+        assert persisted["punch_out"] is None
+        assert persisted["work_hours"] is None
+        assert persisted["late_minutes"] == 0
+        assert persisted["overtime_minutes"] == 0
+        assert persisted["half_day"] is False
+        assert len(persisted["history"]) == 1
+        history = persisted["history"][0]
+        assert history["by"] == "supervisor"
+        assert history["reason"] == "Corrected missed start time"
+        assert history["changes"]["punch_in"] == {
+            "from": int(original_punch_in.timestamp() * 1000),
+            "to": int(corrected_punch_in.timestamp() * 1000),
+        }
