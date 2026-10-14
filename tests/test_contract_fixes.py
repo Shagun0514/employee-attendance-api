@@ -703,6 +703,58 @@ def test_department_summary_calculations_include_zero_log_headcount_in_mongodb(
 
 
 @pytest.mark.integration
+def test_department_summary_excludes_older_attendance_record_in_mongodb(
+    isolated_mongodb,
+):
+    isolated_mongodb.employees.insert_many([
+        {
+            **employee_document(), "emp_code": "EMP1001",
+            "name": "No October attendance", "email": "emp1001@example.com",
+            "joined_on": "2026-01-15",
+        },
+        {
+            **employee_document(), "emp_code": "EMP4444",
+            "name": "October attendance", "email": "emp4444@example.com",
+            "joined_on": "2026-10-14",
+        },
+    ])
+    isolated_mongodb.attendance_logs.insert_many([
+        {
+            "emp_code": "EMP4444", "date": "2026-10-14",
+            "status": "PRESENT", "late_minutes": 396,
+            "work_hours": 24, "overtime_minutes": 1296,
+        },
+        {
+            "emp_code": "EMP4444", "date": "1973-03-03",
+            "status": "PRESENT", "late_minutes": 346,
+            "work_hours": None, "punch_out": None,
+        },
+    ])
+
+    # Verify the exact dataset visible to the aggregation; an attendance list
+    # page is paginated and cannot establish that no other monthly rows exist.
+    assert isolated_mongodb.attendance_logs.count_documents({}) == 2
+    assert isolated_mongodb.attendance_logs.count_documents({
+        "date": {"$gte": "2026-10-01", "$lte": "2026-10-31"}
+    }) == 1
+
+    response = request(
+        "GET", "/analytics/departments/summary?month=2026-10&department=Engineering"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "month": "2026-10",
+        "items": [{
+            "department": "Engineering", "headcount": 2,
+            "present_days": 1, "avg_work_hours": 24,
+            "late_count": 1, "total_late_minutes": 396,
+            "leave_count": 0, "on_duty_count": 0,
+        }],
+    }
+
+
+@pytest.mark.integration
 def test_late_leaderboard_ranks_ties_after_department_filter_in_mongodb(
     isolated_mongodb,
 ):
