@@ -521,6 +521,7 @@ def punch_out(payload: PunchInIn):
         updated = db.attendance_logs.find_one_and_update(
             {
                 "_id": open_record["_id"],
+                "punch_in": open_record["punch_in"],
                 "punch_out": None,
             },
             {
@@ -769,6 +770,9 @@ def regularize_attendance(
             {
                 "_id": current["_id"],
                 "history": current.get("history", []),
+                "status": current["status"],
+                "punch_in": current.get("punch_in"),
+                "punch_out": current.get("punch_out"),
             },
             {
                 "$set": updates,
